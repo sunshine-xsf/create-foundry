@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+output/
+.env
+.env.*
+foundry.local.json
+# 原始目录可能含明文凭据与历史密钥报告，不应直接提交到版本库。
+__MACOSX/
+
+# 本地凭据及编辑器/手工备份，不要分享或提交。
+foundry.local.json.*
+foundry.*.local.json
+
+# Excel 更新备份可能含用户部署计划。
+*.xlsx.*.bak

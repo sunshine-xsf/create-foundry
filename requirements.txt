@@ -1,0 +1,2 @@
+﻿# 只在读取 .xlsx 时需要；JSON/CSV 部署无需第三方库。
+openpyxl>=3.1,<4
