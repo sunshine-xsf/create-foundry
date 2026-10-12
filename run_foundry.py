@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""双击入口：Excel 填部署计划，JSON 仅填写三项服务主体凭据。
+"""真实部署执行入口：网页完整计划，或兼容的 Excel + JSON 入口。
 
-默认实际部署并等待完成；--dry-run 仅离线检查。不会把凭据放进命令行。
-每次运行在 output 生成带本地日期的中文 CSV / JSON / XLSX，以及脱敏诊断。
+默认实际部署并等待完成；--dry-run 仅离线检查。网页凭据通过 stdin 传入，
+不会进入命令行或临时凭据文件。每批输出同名、带本地日期的 CSV / JSON；
+兼容的 Excel 入口额外生成 XLSX。诊断和导出结果会脱敏。
 """
 from __future__ import annotations
 
@@ -43,12 +44,15 @@ def record_failure(directory: Path, mode: str, status: str, message: str, *, exp
 def print_reports(exporter) -> None:
     for suffix, label in [(".json", "JSON"), (".csv", "CSV"), (".xlsx", "Excel")]:
         path = exporter.path(suffix)
+        if suffix == ".xlsx" and not exporter.include_xlsx:
+            continue
         print(label + " 报告：" + (str(path) if path.exists() else "未生成，请检查写入警告"), flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Excel 部署计划 + JSON 登录凭据；默认实际部署 Foundry")
     parser.add_argument("--config", type=Path, default=Path(__file__).resolve().with_name("foundry.local.json"), help="登录凭据 JSON")
+    parser.add_argument("--config-stdin", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--output-dir", type=Path, help="报告输出目录；网页系统会指定本项目 output 文件夹")
     parser.add_argument("--report-stem", help=argparse.SUPPRESS)
     source = parser.add_mutually_exclusive_group()
@@ -66,26 +70,32 @@ def main(argv: list[str] | None = None) -> int:
     directory = None
     temporary_workspace = None
     output_dir = args.output_dir.resolve() if args.output_dir else config.parent / "output"
-    exporter = ReportExporter(output_dir, stem=args.report_stem)
+    exporter = ReportExporter(output_dir, stem=args.report_stem, include_xlsx=not args.plan_json)
     print("=== Foundry 一键部署 ===", flush=True)
     print("模式：离线预览，不访问 Azure" if args.dry_run else "模式：实际部署，将创建云资源，可能产生费用", flush=True)
     try:
         # 部署过程会持续覆盖写入中间状态，放到系统临时目录而非 output。
-        # 这样 output 只保留最终带日期的 CSV / JSON / XLSX 各一份，不再产生重复的 results 子文件夹。
+        # 每批在 output 保留同名、带日期的 CSV / JSON 各一份；Excel 入口额外生成 XLSX。
         temporary_workspace = tempfile.TemporaryDirectory(prefix="foundry-run-")
         directory = Path(temporary_workspace.name)
         deploy.write_report(directory, [{"status": "starting", "error": ""}], mode, 0, exporter=exporter)
-        if not config.is_file():
+        if args.config_stdin and not args.plan_json:
+            raise deploy.PlanError("标准输入配置仅支持网页完整计划")
+        if not args.config_stdin and not config.is_file():
             raise deploy.PlanError("找不到配置文件；网页请通过双击部署.cmd 启动；Excel 入口请检查 foundry.local.json 路径")
         # 同一次读取传给核心认证；默认绝不回退使用 JSON 里的旧部署计划。
-        document = deploy.read_json_document(config)
+        document = json.loads(sys.stdin.read(1_000_001)) if args.config_stdin else deploy.read_json_document(config)
         if not isinstance(document, dict):
             raise deploy.PlanError("一键部署 JSON 必须是对象，请在 credentials 中填写三个 AZURE_ 字段")
+        # 标准输入路径同样先登记秘密，后续错误或报告必须脱敏。
+        for key, value in (document.get("credentials") or {}).items() if isinstance(document.get("credentials"), dict) else []:
+            if "secret" in key.lower() or "token" in key.lower():
+                deploy.remember_secret(value)
         deploy.validate_json_sections(document)
         if not args.dry_run and "credentials" not in document:
             raise deploy.PlanError("一键部署需要 JSON credentials，请填写三个 AZURE_ 凭据字段")
         options = document.get("run", {})
-        exporter.include_api_keys = not (args.no_api_key or args.dry_run or args.plan_json) and options.get("export_api_key", True)
+        exporter.include_api_keys = not (args.no_api_key or args.dry_run or args.plan_json) and options.get("export_api_key", False)
         if exporter.include_api_keys:
             print("提示：结果“密钥”列将尝试导出资源 API key；请把 output 按敏感文件保管。", flush=True)
         command = ["--dry-run" if args.dry_run else "--apply", "--auth", "service-principal"]
@@ -104,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
             if options.get(key, default):
                 command.append("--" + key.replace("_", "-"))
         # 并发数来自网页配置，核心 CLI 限制范围；Excel 入口默认保持串行。
-        command += ["--max-concurrency", str(options.get("max_concurrency", 1))]
+        command += ["--max-concurrency", str(options.get("max_concurrency", 3))]
         code = deploy.main(command, config_document=document, run_directory=directory, report_exporter=exporter)
         if code == 130:
             record_failure(directory, mode, "interrupted", "用户中断；若请求已提交，Azure 端任务可能继续", exporter=exporter)

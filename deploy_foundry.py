@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
+from threading import RLock
 import argparse
 import csv
 import hashlib
@@ -88,6 +89,14 @@ class PlanError(ValueError):
 
 class DeployError(RuntimeError):
     """认证、配额、资源状态或部署失败。"""
+
+
+class OperationUnknown(DeployError):
+    """请求可能已生效，但未确认 Azure 最终状态；不得自动重新提交。"""
+
+
+class OperationFailed(DeployError):
+    """Azure 明确返回 Failed / Canceled 等终止状态。"""
 
 
 class ArmError(DeployError):
@@ -290,9 +299,9 @@ def validate_json_sections(document: dict) -> None:
             raise PlanError("run 只允许 update_existing、register_provider、skip_quota_check、export_api_key")
         if any(type(value) is not bool for key, value in options.items() if key != "max_concurrency"):
             raise PlanError("run 开关必须填写 true 或 false，不能加引号")
-        workers = options.get("max_concurrency", 1)
-        if type(workers) is not int or not 1 <= workers <= 4:
-            raise PlanError("max_concurrency 必须为 1–4 的整数")
+        workers = options.get("max_concurrency", 3)
+        if type(workers) is not int or not 1 <= workers <= 8:
+            raise PlanError("max_concurrency 必须为 1–8 的整数")
 
 
 def load_plan(path: Path, sheet: str | None = None, *, document: Any = _MISSING) -> tuple[list[DeployItem], int]:
@@ -542,6 +551,7 @@ class ArmClient:
         url = self.url(path, api)
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
         refreshed = False
+        writing = method.upper() in {"PUT", "POST", "PATCH", "DELETE"}
         for attempt in range(self.retries + 2):
             if deadline is not None and time.monotonic() >= deadline:
                 raise DeployError("ARM 操作等待超时；资源可能仍在部署，请在门户确认后重试")
@@ -556,7 +566,8 @@ class ArmClient:
                     raw = response.read()
                     data = json.loads(raw) if raw else {}
                     if not isinstance(data, dict):
-                        raise DeployError("ARM 返回非对象 JSON")
+                        error_type = OperationUnknown if writing else DeployError
+                        raise error_type("ARM 返回非对象 JSON；写请求的结果需人工核实" if writing else "ARM 返回非对象 JSON")
                     return data, {k.lower(): v for k, v in response.headers.items()}, response.status
             except urllib.error.HTTPError as exc:
                 try:
@@ -572,6 +583,10 @@ class ArmClient:
                     self.tokens.get(self.subscription, refresh=True)
                     refreshed = True
                     continue
+                # 写请求的 5xx 不能证明服务端未执行，不自动再次提交。
+                # 明确拒绝的 429 仍按 Retry-After 退避；只读请求保留原重试策略。
+                if writing and exc.code >= 500:
+                    raise OperationUnknown(f"ARM 写请求返回 HTTP {exc.code}；结果待核实，不会自动重试: {path}") from None
                 if exc.code not in RETRY_STATUSES or attempt >= self.retries:
                     raise ArmError(exc.code, text(error.get("code")), redact(text(error.get("message")) or "ARM 请求失败")) from None
                 try:
@@ -579,10 +594,18 @@ class ArmClient:
                 except (ValueError, TypeError):
                     pass
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if writing:
+                    raise OperationUnknown(f"ARM 写请求通信中断；结果待核实，不会自动重试: {path}；{redact(str(exc))}") from None
                 if attempt >= self.retries:
                     raise DeployError(f"ARM 网络请求失败: {redact(str(exc))}") from None
             except ValueError:
-                raise DeployError("ARM 返回了无效 JSON") from None
+                error_type = OperationUnknown if writing else DeployError
+                raise error_type("ARM 写请求返回无效 JSON；结果待核实，不会自动重试" if writing else "ARM 返回了无效 JSON") from None
+            except DeployError:
+                raise
+            except Exception as exc:
+                error_type = OperationUnknown if writing else DeployError
+                raise error_type(f"ARM {'写请求结果待核实，不会自动重试' if writing else '响应读取失败'}: {path}；{redact(str(exc))}") from None
             if deadline is not None:
                 retry_delay = min(retry_delay, max(0, deadline - time.monotonic()))
             time.sleep(retry_delay)
@@ -622,36 +645,121 @@ class ArmClient:
                 resource = self.request("GET", path, api=api, deadline=deadline)[0]
             except ArmError as exc:
                 if exc.status != 404:
-                    raise
+                    raise OperationUnknown(f"无法确认资源最终状态: {path}；{redact(str(exc))}") from None
                 resource = {}
-            state = text(resource.get("properties", {}).get("provisioningState")).casefold()
+            except DeployError as exc:
+                raise OperationUnknown(f"无法确认资源最终状态: {path}；{redact(str(exc))}") from None
+            properties = resource.get("properties") or {}
+            if not isinstance(properties, dict):
+                raise OperationUnknown(f"资源状态响应无效，请核实: {path}")
+            state = text(properties.get("provisioningState")).casefold()
             if state == "succeeded" or (resource and not state and allow_stateless):
                 return resource
             if state in FAILED_STATES:
-                raise DeployError(f"资源进入终止状态 {state}: {path}")
+                raise OperationFailed(f"资源进入终止状态 {state}: {path}")
             time.sleep(min(self.poll_interval, max(0, deadline - time.monotonic())))
-        raise DeployError(f"等待资源超时: {path}；不会自动删除资源，请在 Azure 门户检查")
+        raise OperationUnknown(f"等待资源超时: {path}；Azure 可能仍在处理，请先核实，不会自动重试或删除")
 
-    def put(self, path: str, body: dict, api: str = COGNITIVE_API) -> dict:
+    def put(self, path: str, body: dict, api: str = COGNITIVE_API, *, allow_stateless: bool = False) -> dict:
         deadline = time.monotonic() + self.timeout
         _, headers, _ = self.request("PUT", path, body, api, deadline)
         # HTTP 202 不是成功；优先等待 Azure 的异步操作状态，再读资源本身。
-        operation = headers.get("azure-asyncoperation") or headers.get("operation-location") or headers.get("location")
-        if operation:
-            while time.monotonic() < deadline:
-                result, _, status = self.request("GET", operation, api=api, deadline=deadline)
-                state = text(result.get("status") or result.get("properties", {}).get("provisioningState")).casefold()
-                if state in FAILED_STATES:
-                    raise DeployError("Azure 异步操作失败: " + redact(json.dumps(result.get("error", {"status": state}), ensure_ascii=False)))
-                if state == "succeeded" or (status in (200, 204) and not state):
-                    break
-                time.sleep(min(self.poll_interval, max(0, deadline - time.monotonic())))
-        return self.wait_resource(path, api, deadline, allow_stateless=(api == RESOURCE_API))
+        try:
+            operation = headers.get("azure-asyncoperation") or headers.get("operation-location") or headers.get("location")
+            if operation:
+                while time.monotonic() < deadline:
+                    result, _, status = self.request("GET", operation, api=api, deadline=deadline)
+                    state = text(result.get("status") or result.get("properties", {}).get("provisioningState")).casefold()
+                    if state in FAILED_STATES:
+                        raise OperationFailed("Azure 异步操作失败: " + redact(json.dumps(result.get("error", {"status": state}), ensure_ascii=False)))
+                    if state == "succeeded" or (status in (200, 204) and not state):
+                        break
+                    time.sleep(min(self.poll_interval, max(0, deadline - time.monotonic())))
+            return self.wait_resource(path, api, deadline, allow_stateless=allow_stateless or api == RESOURCE_API)
+        except (OperationFailed, OperationUnknown):
+            raise
+        except Exception as exc:
+            # 包括轮询权限不足、断网及无效响应。它们不等于部署失败。
+            raise OperationUnknown(f"Azure 已接收写请求，但最终结果未确认: {path}；{redact(str(exc))}") from None
 
 # -------------------- 业务层：创建资源、模型选择、配额检查 --------------------
+def model_deployment_config(model: dict, sku: dict) -> dict:
+    """只比较部署身份、生命周期及所选 SKU，不比较模型展示元数据。"""
+    # 模型 PUT 使用 format/name/version；生命周期用于排除 deprecated。
+    # SKU 保留容量、配额池、速率及未知配置，避免把真正的 SKU 冲突误合并。
+    display_fields = {"description", "displayName", "localizedName", "localizedDescription"}
+    config = {key: value for key, value in sku.items() if key not in display_fields}
+    config["name"] = text(sku.get("name"))
+    config["usageName"] = text(sku.get("usageName")).casefold()
+    capacity = sku.get("capacity")
+    if capacity is None or isinstance(capacity, dict):
+        limits = dict(capacity or {})
+        limits.setdefault("minimum", 1)
+        if isinstance(limits.get("allowedValues"), list):
+            limits["allowedValues"] = sorted(limits["allowedValues"], key=lambda v: json.dumps(v, sort_keys=True))
+        config["capacity"] = limits
+    return {
+        "model": {"name": text(model.get("name")), "format": text(model.get("format")).casefold(),
+                  "version": text(model.get("version")),
+                  "lifecycleStatus": text(model.get("lifecycleStatus")).casefold()},
+        "sku": config,
+    }
+
+
+def model_config_conflicts(configs: list[dict]) -> str:
+    """只输出参与选择的配置差异；限制长度，不输出完整目录或凭据。"""
+    def flatten(value: dict, prefix: str = "") -> dict:
+        result = {}
+        for key, child in value.items():
+            path = f"{prefix}.{key}" if prefix else key
+            if isinstance(child, dict) and child:
+                result.update(flatten(child, path))
+            else:
+                result[path] = child
+        return result
+    records = [flatten(config) for config in configs]
+    differences = []
+    for field in sorted({key for record in records for key in record}):
+        values = sorted({json.dumps(record[field], sort_keys=True, ensure_ascii=False)
+                         if field in record else "(缺失)" for record in records})
+        if len(values) > 1:
+            if any(word in field.casefold() for word in ("secret", "password", "token", "key")):
+                detail = "(值已隐藏)"
+            else:
+                detail = " / ".join(value[:160] for value in values[:4])
+            differences.append(f"{field}: {detail}")
+    return "；".join(differences[:8]) or "目录配置不同"
+
+
+def ordinary_model_sku_purpose(model: dict, sku: dict) -> tuple[str, str]:
+    """为普通 OpenAI 模型区分推理 SKU 与微调用途；不猜测配额池。"""
+    if text(model.get("format")).casefold() != "openai":
+        return "inference", ""
+    usage = text(sku.get("usageName"))
+    # 对截图中明确的 -finetune 配额池做边界匹配，不能按模型名随意猜测。
+    # 模型 capabilities.fineTune 仅表示支持微调，绝不能据此排除普通推理。
+    if re.search(r"(?:^|[.\-_])(?:finetune|fine[-_]?tuning|fine[-_]tune)(?:$|[.\-_])", usage, re.I):
+        return "finetune", f"usageName={usage} 明确属于微调用途"
+    costs = sku.get("costs") or []
+    if isinstance(costs, list):
+        hourly_hosting = any(
+            isinstance(cost, dict)
+            and text(cost.get("name")).casefold() == "hosting"
+            and re.search(r"\bhours?\b", text(cost.get("unit")), re.I)
+            for cost in costs
+        )
+        # Hosting 按小时计费是用途线索，但单独出现不足以安全判为微调。
+        # Provisioned SKU 本身也可能按小时计费；仅按量普通模型做歧义检查。
+        if hourly_hosting and text(sku.get("name")) in {"Standard", "GlobalStandard", "DataZoneStandard"}:
+            return "ambiguous", "存在 Hosting 按小时计费，但缺少明确微调配额标识"
+    return "inference", ""
+
+
 def choose_model(catalog: list[dict], item: DeployItem) -> tuple[dict, dict]:
     """空版本使用 Azure 标记的默认版本，不用字符串排序猜“最新版”。"""
     candidates: list[tuple[dict, dict]] = []
+    excluded_finetune = 0
+    ambiguous_purposes: list[str] = []
     for model in catalog:
         if model.get("name") != item.model_name or text(model.get("format")).casefold() != item.model_format.casefold():
             continue
@@ -661,13 +769,50 @@ def choose_model(catalog: list[dict], item: DeployItem) -> tuple[dict, dict]:
             continue
         for sku in model.get("skus") or []:
             if sku.get("name") == item.sku_name:
+                purpose, reason = ordinary_model_sku_purpose(model, sku)
+                if purpose == "finetune":
+                    excluded_finetune += 1
+                    continue
+                if purpose == "ambiguous":
+                    ambiguous_purposes.append(f"版本 {text(model.get('version'))}: {reason}")
+                    continue
                 candidates.append((model, sku))
+    if ambiguous_purposes:
+        raise DeployError(
+            f"普通模型 {item.model_name} / SKU {item.sku_name} 存在用途不明确的目录记录："
+            + "；".join(sorted(set(ambiguous_purposes))[:4])
+            + "；已停止部署，不会猜测或混用微调托管配置"
+        )
     if not candidates:
+        if excluded_finetune:
+            raise DeployError(
+                f"普通模型 {item.model_name} {item.model_version or '(默认版本)'} / {item.sku_name} "
+                f"仅匹配到 {excluded_finetune} 条微调用途记录，已排除；当前目录没有匹配的普通推理 SKU"
+            )
         raise DeployError(f"区域/账号未提供可用组合：{item.model_name} {item.model_version or '(默认版本)'} / {item.sku_name}")
+    # 先按 Azure 的默认标记选候选，再去重；显式版本不受默认标记差异影响。
     defaults = [pair for pair in candidates if pair[0].get("isDefaultVersion") is True]
-    selected = defaults if not item.model_version and defaults else candidates
+    selected_candidates = defaults if not item.model_version and defaults else candidates
+    unique: dict[str, tuple[dict, dict]] = {}
+    for model, sku in selected_candidates:
+        signature = json.dumps(model_deployment_config(model, sku), sort_keys=True, ensure_ascii=False)
+        # 相同签名的部署相关配置一致，因此可使用任一等价记录，而非任意取冲突记录。
+        unique.setdefault(signature, (model, sku))
+    selected = list(unique.values())
     if len(selected) != 1:
-        raise DeployError(f"模型 {item.model_name} 有多个匹配版本且没有唯一默认版本；请填写 model_version")
+        versions = sorted({text(model.get("version")) or "(缺失版本)" for model, _ in selected})
+        if item.model_version or len(versions) == 1:
+            # 用户已经指定版本时，不再错误要求重复填写 model_version。
+            raise DeployError(
+                f"模型 {item.model_name} / 版本 {', '.join(versions)} / SKU {item.sku_name} "
+                f"存在 {len(selected)} 条部署配置不同的目录记录；冲突字段："
+                + model_config_conflicts([model_deployment_config(model, sku) for model, sku in selected])
+                + "；已停止部署，不会随意选择记录。请刷新模型目录或核查 Azure 返回配置"
+            )
+        raise DeployError(
+            f"模型 {item.model_name} 没有唯一默认版本；可选版本：{', '.join(versions)}；"
+            "请在模型版本选项中选择明确版本"
+        )
     model, sku = selected[0]
     if not text(model.get("version")):
         raise DeployError("Azure 模型目录未返回版本，拒绝猜测")
@@ -695,18 +840,41 @@ def same_deployment(existing: dict, item: DeployItem, version: str | None = None
             and (not item.rai_policy_name or text(existing.get("properties", {}).get("raiPolicyName")) == item.rai_policy_name))
 
 
+def quota_details(usages: list[dict], usage_name: str) -> tuple[float | None, str]:
+    """精确匹配 usageName；等价重复记录可合并，冲突或异常不得当作零配额。"""
+    if not usage_name:
+        return None, "模型目录未返回配额标识 usageName"
+    matches = []
+    for usage in usages:
+        if not isinstance(usage, dict):
+            continue
+        name = usage.get("name")
+        value = name.get("value") if isinstance(name, dict) else name if isinstance(name, str) else ""
+        # 不使用 localizedValue 或模型名猜测配额池。
+        if text(value).casefold() == usage_name.casefold():
+            matches.append(usage)
+    if not matches:
+        return None, f"配额接口返回 {len(usages)} 条记录，但没有匹配 usageName={usage_name} 的记录"
+    balances: set[tuple[float, float, str]] = set()
+    for usage in matches:
+        try:
+            if isinstance(usage.get("limit"), bool) or isinstance(usage.get("currentValue"), bool):
+                raise ValueError("boolean quota")
+            limit, current = float(usage["limit"]), float(usage["currentValue"])
+            if not math.isfinite(limit) or not math.isfinite(current) or limit < 0 or current < 0:
+                raise ValueError("invalid quota")
+            balances.add((limit, current, text(usage.get("unit")).casefold()))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None, f"配额记录 {usage_name} 的 limit/currentValue 缺失或异常"
+    if len(balances) != 1:
+        return None, f"配额标识 {usage_name} 有 {len(matches)} 条记录，其上限、已用量或单位不一致"
+    limit, current, _ = next(iter(balances))
+    return max(0, limit - current), ""
+
+
 def quota_remaining(usages: list[dict], usage_name: str) -> float | None:
-    matches = [u for u in usages if text(u.get("name", {}).get("value")).casefold() == usage_name.casefold()]
-    if not usage_name or len(matches) != 1:
-        return None
-    usage = matches[0]
-    try:
-        limit, current = float(usage["limit"]), float(usage["currentValue"])
-        if not math.isfinite(limit) or not math.isfinite(current) or limit < 0 or current < 0:
-            return None
-        return max(0, limit - current)
-    except (KeyError, TypeError, ValueError):
-        return None
+    # 保留原函数签名供其它调用方使用。
+    return quota_details(usages, usage_name)[0]
 
 
 class Deployer:
@@ -717,8 +885,13 @@ class Deployer:
         self.skip_quota_check = skip_quota_check
         self.register_provider = register_provider
         self.ready: dict[str, dict] = {}
+        self.unresolved: dict[str, str] = {}  # 共用资源状态未知时，后续模型不重复创建。
         self.catalogs: dict[str, list[dict]] = {}
-        # 保守余额避免 usage 尚未刷新时连续提交而超配；本工具默认串行。
+        # 共享资源和模型目录串行准备；模型 PUT / 轮询不持有此锁。
+        self.state_lock = RLock()
+        # 同订阅不同资源组也共享配额余额，预留必须原子执行。
+        self.quota_lock = RLock()
+        # 失败也不归还余额，避免 Azure 已提交但本地超时导致重复占用。
         self.quota_budget: dict[tuple[str, str], float] = {}
         self.provider_ready = False
 
@@ -741,26 +914,39 @@ class Deployer:
 
     def ensure(self, path: str, body: dict, api: str = COGNITIVE_API) -> dict:
         key = path.casefold()
-        if key not in self.ready:
-            existing = self.client.get(path, api)
-            if existing is None:
-                self.ready[key] = self.client.put(path, body, api)
-            else:
-                state = text(existing.get("properties", {}).get("provisioningState")).casefold()
-                if state != "succeeded" and not (api == RESOURCE_API and not state):
-                    existing = self.client.wait_resource(path, api)
-                self.ready[key] = existing
-        return self.ready[key]
+        if key in self.unresolved:
+            raise OperationUnknown(self.unresolved[key])
+        try:
+            if key not in self.ready:
+                existing = self.client.get(path, api)
+                if existing is None:
+                    self.ready[key] = self.client.put(path, body, api)
+                else:
+                    state = text(existing.get("properties", {}).get("provisioningState")).casefold()
+                    if state != "succeeded" and not (api == RESOURCE_API and not state):
+                        existing = self.client.wait_resource(path, api)
+                    self.ready[key] = existing
+            return self.ready[key]
+        except OperationUnknown as exc:
+            self.unresolved[key] = str(exc)
+            raise
 
     def require_existing(self, path: str, label: str, api: str = COGNITIVE_API) -> None:
         """已选已有资源在执行时再次核对；404 绝不降级成创建。"""
-        value = self.client.get(path, api=api)
-        if value is None:
-            raise DeployError(f"所选{label}已不存在，请返回部署目标重新选择；不会自动重建")
-        state = text(value.get("properties", {}).get("provisioningState")).casefold()
-        if state != "succeeded" and not (api == RESOURCE_API and not state):
-            value = self.client.wait_resource(path, api)
-        self.ready[path.casefold()] = value
+        key = path.casefold()
+        if key in self.unresolved:
+            raise OperationUnknown(self.unresolved[key])
+        try:
+            value = self.client.get(path, api=api)
+            if value is None:
+                raise DeployError(f"所选{label}已不存在，请返回部署目标重新选择；不会自动重建")
+            state = text(value.get("properties", {}).get("provisioningState")).casefold()
+            if state != "succeeded" and not (api == RESOURCE_API and not state):
+                value = self.client.wait_resource(path, api)
+            self.ready[key] = value
+        except OperationUnknown as exc:
+            self.unresolved[key] = str(exc)
+            raise
 
     def progress(self, stage: str) -> None:
         callback = getattr(self, "progress_callback", None)
@@ -811,6 +997,10 @@ class Deployer:
         return account, project
 
     def reserve_quota(self, item: DeployItem, sku: dict, existing: dict | None) -> str:
+        with self.quota_lock:
+            return self._reserve_quota(item, sku, existing)
+
+    def _reserve_quota(self, item: DeployItem, sku: dict, existing: dict | None) -> str:
         usage = text(sku.get("usageName"))
         # 同型号+SKU 只计算容量差额；换型号/SKU 不假设旧配额可抵扣。
         old = existing or {}
@@ -842,12 +1032,21 @@ class Deployer:
         except ArmError as exc:
             if self.skip_quota_check and exc.status in {401, 403, 404}:
                 return f"配额接口不可读取（HTTP {exc.status}），按选项交由 Azure 最终校验"
+            if exc.status in {401, 403}:
+                raise DeployError(
+                    f"配额接口访问被拒绝（HTTP {exc.status}）；请核查认证及订阅级配额读取权限 "
+                    "(Cognitive Services Usages Reader)。这不代表配额为零。"
+                    "可显式勾选“配额读取失败时仍尝试部署”交由 Azure 最终校验"
+                ) from exc
             raise
-        remaining = quota_remaining(usages, usage)
+        remaining, reason = quota_details(usages, usage)
         if remaining is None:
             if self.skip_quota_check:
-                return "配额不可核实，按选项交由 Azure 最终校验"
-            raise DeployError("配额接口未返回当前模型的可用配额（不等同于 SP 无效或配额为零）；可勾选“配额读取失败时仍尝试部署”交由 Azure 创建接口校验，或核查订阅级配额读取权限（Cognitive Services Usages Reader）")
+                return reason + "；按选项交由 Azure 最终校验"
+            raise DeployError(
+                reason + "；无法核实配额，不等同于 SP 无效或配额为零。"
+                "可显式勾选“配额读取失败时仍尝试部署”交由 Azure 创建接口校验"
+            )
         key = item.location, usage.casefold()
         available = min(remaining, self.quota_budget.get(key, remaining))
         if increase > available:
@@ -864,13 +1063,18 @@ class Deployer:
                     "enabled": True, "blocking": True}
                    for source in ("Prompt", "Completion")
                    for category in ("Hate", "Sexual", "Violence", "SelfHarm")]
+        if path.casefold() in self.unresolved:
+            raise OperationUnknown(self.unresolved[path.casefold()])
         policy = self.client.get(path)
         if policy is None:
             body = {"properties": {"basePolicyName": "Microsoft.Default",
                                    "mode": "Blocking", "contentFilters": filters}}
             # raiPolicies 的成功响应不一定含 provisioningState；允许轮询无状态的资源。
-            self.client.request("PUT", path, body)
-            policy = self.client.wait_resource(path, allow_stateless=True)
+            try:
+                policy = self.client.put(path, body, allow_stateless=True)
+            except OperationUnknown as exc:
+                self.unresolved[path.casefold()] = str(exc)
+                raise
         properties = policy.get("properties") or {}
         # 不复用显式异步/批注策略，否则界面显示“拦截”而 Azure 实际没有阻断。
         if properties.get("mode", "Blocking") != "Blocking":
@@ -890,9 +1094,11 @@ class Deployer:
             policy_path = item.account_id + "/raiPolicies/" + urllib.parse.quote(item.rai_policy_name, safe="")
             if self.client.get(policy_path) is None:
                 raise DeployError(f"目标 Foundry 资源中不存在内容筛选器 {item.rai_policy_name}；请重新读取并选择")
-        account, project = self.prepare(item)
-        if item.rai_policy_name in GUARD_POLICIES:
-            self.ensure_guard_policy(item)
+        # 共用资源准备完毕后释放锁，让不同模型同时提交、等待。
+        with self.state_lock:
+            account, project = self.prepare(item)
+            if item.rai_policy_name in GUARD_POLICIES:
+                self.ensure_guard_policy(item)
         result["account_endpoint"] = account.get("properties", {}).get("endpoint", "")
         result["project_endpoints"] = project.get("properties", {}).get("endpoints") or {}
         existing = self.client.get(item.deployment_id)
@@ -908,8 +1114,9 @@ class Deployer:
                 raise DeployError("同名部署配置不同；默认不覆盖。确认后添加 --update-existing")
         self.progress("核对模型")
         catalog_key = item.account_id.casefold()
-        if catalog_key not in self.catalogs:
-            self.catalogs[catalog_key] = self.client.list(item.account_id + "/models")
+        with self.state_lock:
+            if catalog_key not in self.catalogs:
+                self.catalogs[catalog_key] = self.client.list(item.account_id + "/models")
         selection = item
         if existing and not item.model_version:
             old_model = existing.get("properties", {}).get("model", {})
@@ -944,7 +1151,7 @@ class Deployer:
         self.progress("提交模型并等待 Azure")
         deployed = self.client.put(item.deployment_id, body)
         if not same_deployment(deployed, item, version):
-            raise DeployError("Azure 返回成功状态，但最终部署配置与计划不一致，请人工检查")
+            raise OperationUnknown("Azure 返回成功状态，但最终部署配置与计划不一致，请人工核实；不会自动重试")
         result["status"] = "updated" if existing else "created"
         result["rai_policy"] = text(deployed.get("properties", {}).get("raiPolicyName"))
 
@@ -1023,7 +1230,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--register-provider", action="store_true", help="允许注册 Microsoft.CognitiveServices 提供程序")
     parser.add_argument("--skip-quota-check", action="store_true", help="配额信息缺失时允许继续；已知不足仍失败")
     parser.add_argument("--detailed-report", action="store_true", help="部署成功后读取订阅、端点、TPM 和策略详情")
-    parser.add_argument("--max-concurrency", type=int, default=1, help="不同资源组并发数 1–4，同一资源组始终串行")
+    parser.add_argument("--max-concurrency", type=int, default=3, help="模型任务并发数 1–8；共享资源先准备，模型提交及等待并行")
     parser.add_argument("--subscription-id", help="只运行指定订阅的计划，不修改计划中的订阅")
     parser.add_argument("--limit", type=int, help="只运行前 N 条，便于先做小范围试部署")
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "output", help="报告父目录；每次新建独立子目录")
@@ -1031,8 +1238,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--poll-interval", type=float, default=5, help="轮询间隔秒数，默认 5")
     parser.add_argument("--retries", type=int, default=4, help="ARM 临时错误最大重试次数，默认 4")
     args = parser.parse_args(argv)
-    if not 1 <= args.max_concurrency <= 4:
-        parser.error("--max-concurrency 必须为 1–4")
+    if not 1 <= args.max_concurrency <= 8:
+        parser.error("--max-concurrency 必须为 1–8")
     if args.limit is not None and args.limit < 1:
         parser.error("--limit 必须大于 0")
     if not all(math.isfinite(v) and v > 0 for v in (args.poll_timeout, args.poll_interval)) or args.retries < 0:
@@ -1114,71 +1321,91 @@ def main(argv: list[str] | None = None, *, config_document: Any = _MISSING,
             except DeployError as exc:
                 for row in rows:
                     if row["subscription_id"] == subscription:
-                        row.update(status="failed", error=redact(str(exc)))
+                        row.update(status="not_run" if isinstance(exc, OperationUnknown) else "failed",
+                                   error=redact(str(exc)) + "；尚未开始模型部署")
                 ready_subscriptions.remove(subscription)
                 print(f"订阅 {subscription}：Provider 预检失败", flush=True)
         if len(ready_subscriptions) != len(subscriptions):
             save_report(rows, mode, duplicates)
             for index, row in enumerate(rows):
-                if row["status"] in {"auth_failed", "failed"}:
+                if row["status"] in {"auth_failed", "failed", "not_run"}:
                     item = plan[index]
                     print(f"[{index + 1}/{len(plan)}] {item.subscription_id}/{item.location}/{item.deployment_name}  {row['status']}: {row['error']}", flush=True)
         if not ready_subscriptions:
             print("没有订阅通过预检，请查看报告中的逐订阅错误", flush=True)
             return 1
-        # One worker per subscription/resource group to avoid account/project races.
-        # Distinct groups and subscriptions may run concurrently (bounded by --max-concurrency).
-        groups: dict[tuple[str, str], list[tuple[int, DeployItem]]] = {}
-        for index, item in enumerate(plan):
-            if item.subscription_id in ready_subscriptions:
-                groups.setdefault((item.subscription_id, item.resource_group.casefold()), []).append((index, item))
-
-        def run_group(tasks: list[tuple[int, DeployItem]]):
-            subscription = tasks[0][1].subscription_id
-            worker_tokens = TokenProvider(auth_mode, credentials=credentials) if credentials is not None else TokenProvider(auth_mode)
-            client = ArmClient(worker_tokens, subscription, args.poll_timeout, args.poll_interval, args.retries)
-            worker = Deployer(client, args.update_existing, args.skip_quota_check, args.register_provider)
-            worker.provider_ready = True
-            for index, item in tasks:
-                row = result_row(item, "running")
-                worker.progress_callback = lambda stage, index=index: print("__FOUNDRY_PROGRESS__" + json.dumps({"index": index, "stage": stage}, ensure_ascii=False), flush=True)
-                try:
-                    worker.deploy(item, row)
-                    worker.progress("读取部署结果")
-                    if args.detailed_report and report_exporter is not None:
-                        try:
-                            from foundry_details import DeploymentDetails
-                            DeploymentDetails(client, report_exporter).enrich(item, row)
-                        except Exception:
-                            row.setdefault("report_warnings", []).append("补充详情读取异常；部署状态保留，请到 Azure 门户核实空白字段。")
-                except (DeployError, ValueError, TypeError, KeyError) as exc:
-                    row.update(status="failed", error=redact(str(exc)))
-                except Exception:
-                    row.update(status="failed", error="未预期的部署异常，请检查 Azure 资源状态并联系维护人员")
-                yield index, row
-
-        batches = list(groups.values())
-        print(f"并发上限={args.max_concurrency}；资源组任务数={len(groups)}", flush=True)
-        # Worker 只向队列提交单条结果，报告仅由主线程写入，避免 CSV/JSON 竞争。
+        # 调度单位是一条模型任务，而不是资源组；并发不会生成额外计划行。
+        tasks = [(index, item) for index, item in enumerate(plan)
+                 if item.subscription_id in ready_subscriptions]
+        group_states = {}
+        quota_states = {}
+        for _, item in tasks:
+            group_key = (item.subscription_id, item.resource_group.casefold())
+            group_states.setdefault(group_key, {"lock": RLock(), "ready": {}, "unresolved": {}, "catalogs": {}})
+            quota_states.setdefault(item.subscription_id, {"lock": RLock(), "budget": {}})
+        # 详情登记 API Key 与报告导出共享字典，使用同一锁，报告仍仅主线程落盘。
+        report_lock = RLock()
+        output_lock = RLock()
         queue: Queue[tuple[int, dict]] = Queue()
-        def perform_group(batch):
-            reported = set()
+
+        def emit_progress(index, stage):
+            with output_lock:
+                print("__FOUNDRY_PROGRESS__" + json.dumps(
+                    {"index": index, "stage": stage}, ensure_ascii=False), flush=True)
+
+        def perform_model(index, item):
+            row = result_row(item, "running")
             try:
-                for index, row in run_group(batch):
-                    reported.add(index)
-                    queue.put((index, row))
+                # 每个模型独立客户端/令牌缓存，避免并发刷新和回调互相覆盖。
+                worker_tokens = (TokenProvider(auth_mode, credentials=credentials)
+                                 if credentials is not None else TokenProvider(auth_mode))
+                worker_tokens.cache = dict(tokens.cache)
+                client = ArmClient(worker_tokens, item.subscription_id,
+                                   args.poll_timeout, args.poll_interval, args.retries)
+                worker = Deployer(client, args.update_existing,
+                                  args.skip_quota_check, args.register_provider)
+                worker.provider_ready = True
+                shared = group_states[(item.subscription_id, item.resource_group.casefold())]
+                worker.state_lock = shared["lock"]
+                worker.ready = shared["ready"]
+                worker.unresolved = shared["unresolved"]
+                worker.catalogs = shared["catalogs"]
+                quota = quota_states[item.subscription_id]
+                worker.quota_lock = quota["lock"]
+                worker.quota_budget = quota["budget"]
+                worker.progress_callback = lambda stage: emit_progress(index, stage)
+                worker.progress("准备共享资源")
+                worker.deploy(item, row)
+                worker.progress("读取部署结果")
+                if args.detailed_report and report_exporter is not None:
+                    try:
+                        from foundry_details import DeploymentDetails
+                        with report_lock:
+                            DeploymentDetails(client, report_exporter).enrich(item, row)
+                    except Exception:
+                        row.setdefault("report_warnings", []).append(
+                            "补充详情读取异常；部署状态保留，请到 Azure 门户核实空白字段。")
+            except OperationUnknown as exc:
+                row.update(status="interrupted", error=redact(str(exc)))
+            except (DeployError, ValueError, TypeError, KeyError) as exc:
+                row.update(status="failed", error=redact(str(exc)))
             except Exception:
-                for index, item in batch:
-                    if index not in reported:
-                        queue.put((index, dict(result_row(item, "failed"), error="资源组任务异常，请检查 Azure 资源状态")))
+                row.update(status="interrupted", error="未预期的部署异常，无法确定最终状态；请先核实 Azure 资源，不会自动重试")
+            finally:
+                # 无论初始化、资源准备或模型部署失败，都必须返回一条结果，避免主线程挂起。
+                queue.put((index, row))
+
+        print(f"模型并发上限={args.max_concurrency}；模型任务数={len(tasks)}；资源组数={len(group_states)}", flush=True)
         try:
             with ThreadPoolExecutor(max_workers=args.max_concurrency) as pool:
-                futures = [pool.submit(perform_group, batch) for batch in batches]
-                for _ in range(sum(len(batch) for batch in batches)):
+                futures = [pool.submit(perform_model, index, item) for index, item in tasks]
+                for _ in tasks:
                     index, row = queue.get()
                     rows[index] = row
-                    print(f"[{index + 1}/{len(plan)}] {plan[index].subscription_id}/{plan[index].location}/{plan[index].deployment_name}  {row['status']}" + (f": {row['error']}" if row.get("error") else ""), flush=True)
-                    save_report(rows, mode, duplicates)
+                    with output_lock:
+                        print(f"[{index + 1}/{len(plan)}] {plan[index].subscription_id}/{plan[index].location}/{plan[index].deployment_name}  {row['status']}" + (f": {row['error']}" if row.get("error") else ""), flush=True)
+                    with report_lock:
+                        save_report(rows, mode, duplicates)
                 for future in futures:
                     future.result()
         except KeyboardInterrupt:
@@ -1189,8 +1416,10 @@ def main(argv: list[str] | None = None, *, config_document: Any = _MISSING,
             return 130
         failures = sum(row["status"] in {"failed", "auth_failed"} for row in rows)
         successes = sum(row["status"] in {"created", "updated", "unchanged"} for row in rows)
-        print(f"已完成：成功/无需变更 {successes}，失败 {failures}；报告目录：{directory}")
-        return 1 if failures else 0
+        unknown = sum(row["status"] == "interrupted" for row in rows)
+        not_run = sum(row["status"] == "not_run" for row in rows)
+        print(f"已完成：成功/无需变更 {successes}，失败 {failures}，未执行 {not_run}，待核实 {unknown}；报告目录：{directory}")
+        return 1 if failures or unknown or not_run else 0
     except (PlanError, DeployError, OSError, ValueError) as exc:
         if directory is not None and not rows:
             try:

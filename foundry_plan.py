@@ -9,7 +9,7 @@ from typing import Any
 import re
 import deploy_foundry as deploy
 
-VERSION = "2026.09.30-targets-v2"
+VERSION = "2026.10.10-customer-v3"
 TARGET_FIELDS = {"id", "label", "subscription_id", "location", "group_mode", "resource_group",
                  "account_mode", "account_name", "project_mode", "project_name"}
 TASK_FIELDS = {"id", "target_id", "model_name", "model_version", "model_format", "sku_name",
@@ -45,7 +45,7 @@ def normalize_targets(raw: Any) -> dict[str, dict]:
             raise deploy.PlanError("部署目标 ID 重复或无效")
         for key in ("group_mode", "account_mode", "project_mode"):
             target[key] = mode(target[key], f"目标 {index} {key}：")
-        for key in ("resource_group", "project_name"):
+        for key in ("resource_group", "account_name", "project_name"):
             string(target[key], f"目标 {index} {key}")
         if target["account_mode"] == "existing":
             string(target["account_name"], f"目标 {index} 已有 Foundry 名称")
@@ -103,3 +103,11 @@ def build_plan(raw_targets: Any, raw_tasks: Any) -> tuple[list[dict], list[dict]
         task_ids.append(task_id)
     # 未选模型的草稿目标不进行 Azure 查询，也不创建资源。
     return plan, [t for key, t in targets.items() if key in used], task_ids
+
+
+def plan_fingerprint(plan, targets, task_ids, options):
+    """无凭据的规范计划指纹；预览与执行必须使用相同名称、映射及选项。"""
+    import hashlib
+    import json
+    value = {"version": VERSION, "deployments": plan, "targets": targets, "task_ids": task_ids, "options": options}
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()

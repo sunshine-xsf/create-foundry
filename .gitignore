@@ -14,3 +14,6 @@ foundry.*.local.json
 
 # Excel 更新备份可能含用户部署计划。
 *.xlsx.*.bak
+
+# 本机任务恢复记录含订阅及资源名称，不分享、不提交。
+.foundry-state/

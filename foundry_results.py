@@ -1,4 +1,4 @@
-"""用户阅读报告：截图中的 22 列，带本地日期的 CSV / JSON / XLSX。
+"""用户阅读报告：固定 22 列、带本地日期的 CSV / JSON；XLSX 可选。
 
 此模块不登录 Azure。客户端密码/令牌永不进入报告；仅明确授权导出的资源
 API key 暂存内存，并且只写成功结果的“密钥”列。内部诊断报告仍全部脱敏。
@@ -34,7 +34,7 @@ NOTES = {
     "TPM": "仅使用服务明确返回的每分钟 token 限制；未知留空，不按 capacity 猜算。",
     "密钥": "敏感：Foundry 资源 API key，不是客户端密码。禁用或无权限时为空。",
     "Endpoint": "Azure 返回的项目端点；多个端点无法唯一选择时保存原映射。",
-    "状态": "created=新建；updated=更新；unchanged=已存在且一致；planned=未部署。",
+    "状态": "created=新建；updated=更新；unchanged=已存在且一致；failed/auth_failed/config_failed=失败；not_run=未执行；interrupted/unknown=结果待核实，不等同失败；starting/running=进行中；planned=离线预览。",
     "错误": "部署/配置错误；详情读取警告另见 JSON report_warnings 和 Excel 运行说明。",
     "模型版本": "成功时为实际解析版本；离线预览时可能为空。",
     "流式过滤模式": "仅读取现有策略，不修改内容过滤设置。",
@@ -42,12 +42,13 @@ NOTES = {
 
 
 class ReportExporter:
-    def __init__(self, output: Path, *, include_api_keys: bool = False, started_at=None, stem: str | None = None):
+    def __init__(self, output: Path, *, include_api_keys: bool = False, started_at=None, stem: str | None = None, include_xlsx: bool = True):
         self.output = Path(output)
         self.started_at = started_at or datetime.now().astimezone()
         if stem is not None and not re.fullmatch(r"results_[A-Za-z0-9_-]{1,100}", stem):
             raise ValueError("报告名称无效")
         self.stem = stem or ("results_" + self.started_at.strftime("%Y-%m-%d_%H%M%S_%f") + "_" + uuid.uuid4().hex[:6])
+        self.include_xlsx = include_xlsx
         self.include_api_keys = include_api_keys
         self._keys: dict[str, str] = {}
 
@@ -91,6 +92,8 @@ class ReportExporter:
             writer.writeheader()
             writer.writerows({key: csv_safe(value) for key, value in row.items()} for row in records)
         temporary.replace(self.path(".csv"))
+        if not self.include_xlsx:
+            return
         columns = [(label, label, NOTES.get(label, "Azure 实际结果 / 部署计划"), width)
                    for label, _, width in RESULT_FIELDS]
         notes = [

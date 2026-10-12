@@ -2,12 +2,13 @@
 """本机 Foundry 批量部署控制台。
 
 浏览器仅连接 http://127.0.0.1:8765；服务主体（SP）凭据由页面 POST 到本机进程，
-仅写入一次性临时 JSON，部署结束后立即删除。凭据绝不写进 output、日志或网页接口响应。
+仅通过子进程标准输入传递，不落临时配置文件。凭据绝不写进 output、日志或网页接口响应。
 真实 Azure 部署仍完全由 run_foundry.py / deploy_foundry.py 执行。
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import ssl
@@ -34,6 +35,7 @@ BASE_DIR = Path(__file__).resolve().parent
 PAGE_FILE = BASE_DIR / "Foundry部署控制台.html"
 RUNNER_FILE = BASE_DIR / "run_foundry.py"
 OUTPUT_DIR = BASE_DIR / "output"
+STATE_DIR = BASE_DIR / ".foundry-state"
 HOST = "127.0.0.1"
 PORT = 8765
 MAX_BODY_BYTES = 1_000_000
@@ -154,9 +156,9 @@ def validate_options(raw: Any) -> dict[str, bool | int]:
         if not isinstance(value, bool):
             raise RequestError("部署选项必须为 true 或 false")
         options[key] = value
-    workers = raw.get("max_concurrency", 2)
-    if type(workers) is not int or not 1 <= workers <= 4:
-        raise RequestError("并发数必须为 1–4 的整数")
+    workers = raw.get("max_concurrency", 3)
+    if type(workers) is not int or not 1 <= workers <= 8:
+        raise RequestError("模型并发数必须为 1–8 的整数")
     options["max_concurrency"] = workers
     return options
 
@@ -543,12 +545,6 @@ def lookup_content_filters(credentials: dict[str, str], subscription_id: str, re
     return {"account": {"subscription_id": subscription_id, "resource_group": resource_group, "name": account_name}, "filters": filters}
 
 
-def write_temp_plan(path: Path, plan: list[dict], credentials: dict, options: dict) -> None:
-    """一次性 JSON 直接交给真实脚本；网页无需安装 Excel 读取依赖。"""
-    path.write_text(json.dumps({"credentials": credentials, "run": options,
-                                "deployments": plan}, ensure_ascii=False), encoding="utf-8")
-
-
 def redact_for_page(message: str, secret: str = "") -> str:
     """再次过滤子进程日志，确保 Client Secret 绝不会返回浏览器。"""
     result = deploy.redact(message)
@@ -558,26 +554,194 @@ def redact_for_page(message: str, secret: str = "") -> str:
     return result[:4000]
 
 
+def process_alive(pid):
+    """仅用于恢复时阻止与遗留子进程并行，权限不明时保守阻止。"""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: PID 不存在
+        try:
+            code = wintypes.DWORD()
+            return not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def write_state_file(filename: str, value: dict) -> None:
+    """同目录原子替换；临时文件也只包含脱敏状态，不含 SP 或令牌。"""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    destination = STATE_DIR / filename
+    temporary = destination.with_name(destination.name + ".tmp-" + uuid.uuid4().hex)
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(destination)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 class DeploymentManager:
-    """单批运行；按明确的报告文件和任务 ID 对齐结果，不猜测成功数量。"""
+    """单批运行；先保存接收记录再启动进程，未知状态不自动重放。"""
     SUCCESS = {"created", "updated", "unchanged"}
-    FAILURE = {"failed", "auth_failed", "config_failed", "not_run", "interrupted"}
+    FAILURE = {"failed", "auth_failed", "config_failed"}
+    LIVE = {"pending", "starting", "running"}
+    TERMINAL = SUCCESS | FAILURE | {"not_run", "interrupted"}
+    JOB_STATES = {"running", "recovery_required", "succeeded", "completed_with_errors", "failed"}
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._active_id = None
         self._latest = None
+        self._recover()
+
+    def _persist(self, job=None, *, required=False, admission=False):
+        """接收阶段同时写回执；后续更新只写任务。失败绝不宣称 Azure 未执行。"""
+        job = job if job is not None else self._latest
+        if not job:
+            return True
+        value = {key: job.get(key) for key in (
+            "id", "request_id", "plan_hash", "status", "message", "started_at", "finished_at",
+            "exit_code", "total", "stem", "process_id", "handoff_started", "recovered_acknowledged")}
+        value["entries"] = [{key: entry.get(key) for key in ("id", "row", "status", "stage", "error")}
+                            for entry in job["entries"]]
+        try:
+            # 回执先写、任务日志最后提交。部分落盘不能把待恢复任务提前解锁。
+            if admission and job.get("request_id"):
+                write_state_file("request-" + job["request_id"] + ".json", {
+                    "status": "accepted", "job_id": job["id"], "plan_hash": job.get("plan_hash")})
+            write_state_file("latest.json", value)
+            return True
+        except OSError:
+            if required:
+                raise RequestError("无法保存本地任务记录；请检查目录权限、文件占用或磁盘空间") from None
+            job["storage_warning"] = "任务记录保存失败，请勿重启服务；请检查磁盘空间和目录权限"
+            return False
+
+    @classmethod
+    def _validate_journal(cls, job):
+        """损坏的记录不能被当作空任务，否则可能误启动第二个部署批次。"""
+        if not isinstance(job, dict) or job.get("status") not in cls.JOB_STATES:
+            raise ValueError("invalid journal status")
+        if not isinstance(job.get("id"), str) or not re.fullmatch(r"[a-f0-9]{12}", job["id"]):
+            raise ValueError("invalid job id")
+        if not isinstance(job.get("request_id"), str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", job["request_id"]):
+            raise ValueError("invalid request id")
+        if not isinstance(job.get("stem"), str) or not re.fullmatch(r"results_[A-Za-z0-9_-]{1,100}", job["stem"]):
+            raise ValueError("invalid report stem")
+        if not isinstance(job.get("plan_hash"), str) or not re.fullmatch(r"[a-f0-9]{64}", job["plan_hash"]):
+            raise ValueError("invalid plan hash")
+        datetime.fromisoformat(job["started_at"])
+        pid = job.get("process_id")
+        if pid is not None and (type(pid) is not int or pid <= 0):
+            raise ValueError("invalid process id")
+        entries = job.get("entries")
+        if not isinstance(entries, list) or not 1 <= len(entries) <= 100:
+            raise ValueError("invalid entries")
+        seen = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                raise ValueError("invalid entry")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", entry["id"]) or entry["id"] in seen:
+                raise ValueError("invalid task id")
+            seen.add(entry["id"])
+            row = entry.get("row")
+            if not isinstance(row, dict) or set(row) - PLAN_KEYS or not all(isinstance(v, str) for v in row.values()):
+                raise ValueError("invalid saved plan")
+            if not all(row.get(k) for k in ("subscription_id", "resource_group", "account_name", "deployment_name", "model_name")):
+                raise ValueError("incomplete saved plan")
+            if not isinstance(entry.get("status"), str):
+                raise ValueError("invalid task status")
+            if entry["status"] not in cls.LIVE | cls.TERMINAL:
+                entry.update(status="interrupted", stage="状态待核实", error="旧记录包含未知状态，请核实 Azure 状态")
+        job["total"] = len(entries)
+
+    def _recover(self):
+        journal = STATE_DIR / "latest.json"
+        try:
+            job = json.loads(journal.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError):
+            raise RuntimeError("本地任务记录无法读取，请保留 .foundry-state 并核实 Azure 状态后处理") from None
+        try:
+            self._validate_journal(job)
+            job.update(logs=[], files=[], report=None)
+            self._refresh(job)
+            unknown = any(e["status"] == "interrupted" for e in job["entries"])
+            if job["status"] in {"running", "recovery_required"} or (unknown and not job.get("recovered_acknowledged")):
+                # 新记录明确知道是否开始传入凭据；旧版本缺该标记时保守视为可能已执行。
+                may_have_run = job.get("handoff_started") is not False
+                for entry in job["entries"]:
+                    if entry["status"] in self.LIVE:
+                        entry.update(status="interrupted" if may_have_run else "not_run",
+                                     stage="状态待核实" if may_have_run else "未执行",
+                                     error="服务曾中断；请核实 Azure 状态" if may_have_run else "服务在提交部署前中断，未传入凭据")
+                job.update(status="recovery_required", message="已恢复上次任务；核实后解除锁定，不会自动重试")
+                self._active_id = job["id"]
+            self._latest = job
+        except (ValueError, KeyError, TypeError):
+            raise RuntimeError("本地任务记录内容无效，请保留 .foundry-state 并核实 Azure 状态后处理") from None
+
+    def acknowledge_recovery(self, job_id):
+        with self._lock:
+            job = self._latest
+            if not job or job["id"] != job_id or job["status"] != "recovery_required":
+                raise RequestError("没有匹配的待核实任务")
+            if job.get("process_id") and process_alive(job["process_id"]):
+                raise RequestError("上次部署子进程仍存在，请等待其结束，不能启动重复部署")
+            # 只修改候选副本；导出/落盘失败时，原任务仍有恢复按钮且继续锁定。
+            candidate = json.loads(json.dumps(job, ensure_ascii=False))
+            self._refresh(candidate)
+            for entry in candidate["entries"]:
+                if entry["status"] in self.LIVE:
+                    entry.update(status="interrupted", stage="状态待核实")
+            ok = all(e["status"] in self.SUCCESS for e in candidate["entries"])
+            candidate.update(status="succeeded" if ok else "completed_with_errors", recovered_acknowledged=True,
+                             message="已解除本地锁定；待核实项不会改成成功，也不会自动重试",
+                             finished_at=candidate.get("finished_at") or datetime.now().astimezone().isoformat(timespec="seconds"))
+            candidate.pop("storage_warning", None)
+            try:
+                self._finalize_report(candidate)
+                self._persist(candidate, required=True, admission=True)
+            except OSError:
+                raise RequestError("报告仍无法写入，请关闭占用文件或检查目录权限；任务保持锁定") from None
+            self._latest = candidate
+            self._active_id = None
+            return self._snapshot(candidate)
 
     def _snapshot(self, job):
         if not job:
             return {"status": "idle", "message": "尚未开始部署"}
-        entries = job["entries"]
-        counts = {"success": sum(e["status"] in self.SUCCESS for e in entries),
-                  "failed": sum(e["status"] in self.FAILURE for e in entries),
-                  "running": sum(e["status"] == "running" for e in entries),
-                  "pending": sum(e["status"] == "pending" for e in entries)}
-        result = {k: job.get(k) for k in ("id", "request_id", "status", "message", "started_at", "finished_at", "exit_code", "total", "logs", "files", "entries", "report")}
-        result.update(counts=counts, completed=counts["success"] + counts["failed"])
+        counts = dict.fromkeys(("success", "failed", "not_run", "unknown", "running", "pending"), 0)
+        for entry in job["entries"]:
+            status = entry["status"]
+            category = ("success" if status in self.SUCCESS else "failed" if status in self.FAILURE else
+                        "not_run" if status == "not_run" else "running" if status in {"running", "starting"} else
+                        "pending" if status == "pending" else "unknown")
+            counts[category] += 1
+        result = {k: job.get(k) for k in ("id", "request_id", "plan_hash", "status", "message", "started_at", "finished_at", "exit_code", "total", "logs", "files", "entries", "report")}
+        if job.get("storage_warning"):
+            result["message"] = str(result["message"] or "") + "；" + job["storage_warning"]
+        result.update(counts=counts, completed=counts["success"] + counts["failed"] + counts["not_run"])
         return json.loads(json.dumps(result, ensure_ascii=False))
 
     @staticmethod
@@ -586,30 +750,39 @@ class DeploymentManager:
         return tuple(str(row.get(key, "")).casefold() for key in keys)
 
     def _refresh(self, job):
-        """读取原子替换的本批报告；其它进程生成的文件不属于这个批次。"""
+        """仅读取本批原子报告；最终状态不被晚到的排队/进度事件覆盖。"""
         path = OUTPUT_DIR / (job["stem"] + ".json")
         try:
             report = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(report, dict) or not isinstance(report.get("deployments"), list):
                 return
+            if report.get("batch_id") not in (None, job["id"]):
+                return
         except (OSError, ValueError):
             return
+        # 网页入口不导出密钥；即使手工替换了报告，也不通过状态接口回传密钥。
+        for row in report["deployments"]:
+            if isinstance(row, dict):
+                row["密钥"] = ""
+        report["contains_resource_api_keys"] = False
         job["report"] = report
         rows = {self._row_key(row, True): row for row in report["deployments"] if isinstance(row, dict)}
         for entry in job["entries"]:
             row = rows.get(self._row_key(entry["row"]))
             if row:
                 status = row.get("状态", "pending")
-                # 报告写入以最终结果为主，不让旧 pending 覆盖实时阶段。
-                if status not in {"pending", "starting", "running"}:
-                    entry.update(status=status, error=row.get("错误", ""),
-                                 stage="完成" if status in self.SUCCESS else "失败")
+                if not isinstance(status, str):
+                    status = "interrupted"
+                if status not in self.LIVE:
+                    status = status if status in self.TERMINAL else "interrupted"
+                    entry.update(status=status, error=str(row.get("错误", "")),
+                                 stage="完成" if status in self.SUCCESS else {"not_run": "未执行", "interrupted": "状态待核实"}.get(status, "失败"))
                 entry["result"] = row
         job["files"] = [{"name": job["stem"] + suffix, "url": "/api/download/" + job["stem"] + suffix}
-                        for suffix in (".json", ".csv", ".xlsx") if (OUTPUT_DIR / (job["stem"] + suffix)).is_file()]
+                        for suffix in (".json", ".csv") if (OUTPUT_DIR / (job["stem"] + suffix)).is_file()]
 
     def _finalize_report(self, job):
-        """补齐未执行/中断项，确保下载报告与页面逐行状态一致。"""
+        """每个模型一条结果，补齐未执行/未知项；CSV 与 JSON 使用同一个文件名前缀。"""
         from collections import Counter
         from foundry_results import ReportExporter, RESULT_FIELDS
         records = []
@@ -617,43 +790,58 @@ class DeploymentManager:
             record = dict(entry["row"])
             result = entry.get("result") or {}
             for label, key, _ in RESULT_FIELDS:
-                if label in result:
+                if label in result and key != "api_key":
                     record[key] = result[label]
-            record.update(status=entry["status"], error=entry.get("error", ""))
+            record.update(status=entry["status"], error=entry.get("error", ""), api_key="")
             records.append(record)
         original = job.get("report") or {}
         report = {key: value for key, value in original.items()
                   if key not in {"deployments", "columns", "summary", "contains_resource_api_keys"}}
         report.update(mode="apply", deployments=records,
                       summary=dict(Counter(row["status"] for row in records)),
-                      finished_at=job["finished_at"])
-        exporter = ReportExporter(OUTPUT_DIR, stem=job["stem"],
+                      finished_at=job["finished_at"], batch_id=job["id"], plan_hash=job.get("plan_hash", ""),
+                      inference_verification="not_performed", counts=self._snapshot(job)["counts"])
+        exporter = ReportExporter(OUTPUT_DIR, stem=job["stem"], include_xlsx=False,
                                   started_at=datetime.fromisoformat(job["started_at"]))
         exporter.write(report)
         self._refresh(job)
 
     def status(self):
         with self._lock:
-            if self._latest and self._latest["status"] == "running":
+            if self._latest and self._latest["status"] in {"running", "recovery_required"}:
                 self._refresh(self._latest)
             return self._snapshot(self._latest)
 
-    def start(self, credentials, plan, options, *, task_ids, request_id=""):
+    def start(self, credentials, plan, options, *, task_ids, request_id, plan_hash):
         with self._lock:
             if self._active_id:
-                raise RequestError("已有部署正在运行，请等待完成")
+                raise RequestError("已有任务运行中或待核实，请先处理该任务")
+            if not plan or len(plan) != len(task_ids) or len(set(task_ids)) != len(task_ids):
+                raise RequestError("任务标识和部署计划不匹配，未开始部署")
             now = datetime.now().astimezone()
             job_id = uuid.uuid4().hex[:12]
-            job = {"id": job_id, "request_id": request_id, "status": "running",
+            job = {"id": job_id, "request_id": request_id, "plan_hash": plan_hash, "status": "running",
                    "message": "正在准备真实 Azure 部署", "started_at": now.isoformat(timespec="seconds"),
                    "stem": "results_" + now.strftime("%Y-%m-%d_%H%M%S_%f") + "_" + job_id,
                    "total": len(plan), "logs": ["已接收计划；登录凭据不会导出。"], "files": [], "report": None,
-                   "entries": [{"id": task_id, "row": row, "status": "pending", "stage": "排队", "error": ""}
+                   "handoff_started": False,
+                   "entries": [{"id": task_id, "row": dict(row), "status": "pending", "stage": "排队", "error": ""}
                                for task_id, row in zip(task_ids, plan)]}
+            self._validate_journal(job)
             self._active_id = job_id
             self._latest = job
-        threading.Thread(target=self._run, args=(job, credentials, plan, options), daemon=True).start()
-        with self._lock:
+            try:
+                # 两份记录全部写成功才允许启动；任何部分写入失败都保留本地待处理任务。
+                self._persist(job, required=True, admission=True)
+                threading.Thread(target=self._run, args=(job, credentials, plan, options), daemon=True).start()
+            except Exception as exc:
+                message = "本次未启动部署：" + redact_for_page(str(exc), credentials.get("AZURE_CLIENT_SECRET", ""))
+                credentials.clear()
+                for entry in job["entries"]:
+                    entry.update(status="not_run", stage="未执行", error=message)
+                job.update(status="recovery_required", message=message + "；修复后确认解除锁定",
+                           finished_at=datetime.now().astimezone().isoformat(timespec="seconds"), exit_code=2)
+                self._persist(job)
             return self._snapshot(job)
 
     def _append_log(self, job, line, secret):
@@ -665,9 +853,11 @@ class DeploymentManager:
                 try:
                     event = json.loads(line[len("__FOUNDRY_PROGRESS__"):])
                     index = event["index"]
-                    if isinstance(index, int) and 0 <= index < len(job["entries"]):
+                    if type(index) is int and 0 <= index < len(job["entries"]):
                         entry = job["entries"][index]
-                        entry.update(status="running", stage=str(event["stage"])[:100])
+                        if entry["status"] in self.LIVE:
+                            entry.update(status="running", stage=str(event["stage"])[:100])
+                            self._persist(job)
                     return
                 except (ValueError, KeyError, TypeError):
                     pass
@@ -676,56 +866,69 @@ class DeploymentManager:
 
     def _run(self, job, credentials, plan, options):
         secret = credentials["AZURE_CLIENT_SECRET"]
+        handed_off = False
+        exit_code = 2
+        error_message = ""
         try:
             if not RUNNER_FILE.is_file() or not PAGE_FILE.is_file():
                 raise RuntimeError("部署系统文件不完整")
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix="foundry-web-") as temp_dir:
-                workspace = Path(temp_dir)
-                config_file = workspace / "deployment-plan.json"
-                write_temp_plan(config_file, plan, credentials, options)
+                config_file = Path(temp_dir) / "deployment-plan.json"  # 仅用于格式识别，永不创建凭据文件。
                 command = [sys.executable, "-u", str(RUNNER_FILE), "--config", str(config_file),
-                           "--plan-json", "--output-dir", str(OUTPUT_DIR),
+                           "--plan-json", "--config-stdin", "--output-dir", str(OUTPUT_DIR),
                            "--report-stem", job["stem"], "--apply", "--no-api-key"]
-                environment = dict(__import__("os").environ)
+                environment = dict(os.environ)
                 environment["PYTHONIOENCODING"] = "utf-8"
-                with subprocess.Popen(command, cwd=str(BASE_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                with subprocess.Popen(command, cwd=str(BASE_DIR), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                       text=True, encoding="utf-8", errors="replace", env=environment) as process:
+                    with self._lock:
+                        # 持久化 PID 和“可能已交付”标记后才写入标准输入；崩溃恢复宁可待核实，不猜测失败。
+                        job.update(process_id=process.pid, handoff_started=True)
+                        self._persist(job, required=True)
+                    assert process.stdin is not None
+                    handed_off = True
+                    process.stdin.write(json.dumps({"credentials": credentials, "run": options, "deployments": plan}, ensure_ascii=False))
+                    process.stdin.close()
                     assert process.stdout is not None
                     for line in process.stdout:
                         self._append_log(job, line, secret)
                     exit_code = process.wait()
-            with self._lock:
-                self._refresh(job)
-                for entry in job["entries"]:
-                    if entry["status"] in {"pending", "running"}:
-                        uncertain = entry["status"] == "running"
-                        entry.update(status="interrupted" if uncertain else "not_run",
-                                     stage="状态待核实" if uncertain else "未执行",
-                                     error="没有收到最终结果；请核实 Azure 状态后重试" if uncertain else "进程结束前未执行，请查看日志")
-                ok = all(e["status"] in self.SUCCESS for e in job["entries"])
-                job.update(exit_code=exit_code, status="succeeded" if ok and exit_code == 0 else "completed_with_errors",
-                           message="部署完成" if ok and exit_code == 0 else "部署结束，存在失败或未确认项")
         except Exception as exc:
-            with self._lock:
-                self._refresh(job)
-                message = "部署系统错误：" + redact_for_page(str(exc), secret)
-                for entry in job["entries"]:
-                    if entry["status"] in {"pending", "running"}:
-                        entry.update(status="interrupted" if entry["status"] == "running" else "not_run", stage="未完成", error=message)
-                job.update(status="failed", message=message, exit_code=2)
+            error_message = "部署系统错误：" + redact_for_page(str(exc), secret)
         finally:
             credentials.clear()
             with self._lock:
-                job["finished_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+                if not handed_off:
+                    job["handoff_started"] = False
+                self._refresh(job)
+                for entry in job["entries"]:
+                    if entry["status"] in self.LIVE:
+                        # 缺失进度不能证明任务没执行；只要交付过配置，缺失结果均是未知。
+                        entry.update(status="interrupted" if handed_off else "not_run",
+                                     stage="状态待核实" if handed_off else "未执行",
+                                     error=error_message or ("没有收到最终结果，请先核实 Azure 状态" if handed_off else "进程未接收部署配置"))
+                unknown = any(e["status"] == "interrupted" for e in job["entries"])
+                ok = all(e["status"] in self.SUCCESS for e in job["entries"]) and exit_code == 0
+                message = error_message or ("部署完成" if ok else "部署结束，存在失败或未执行项")
+                if unknown:
+                    message = "存在状态待核实的模型；请核实云端状态后解除锁定" + ("；" + error_message if error_message else "")
+                job.update(exit_code=exit_code, status="recovery_required" if unknown else "succeeded" if ok else "completed_with_errors",
+                           message=message, finished_at=datetime.now().astimezone().isoformat(timespec="seconds"))
                 try:
                     self._finalize_report(job)
                 except Exception as exc:
-                    # 磁盘/文件占用问题不覆盖真实部署结果，明确告知用户导出失败。
                     message = "结果导出未完成：" + redact_for_page(str(exc), secret)
                     job["logs"].append(message)
-                    job["message"] += "；结果导出未完成，请查看日志"
-                self._active_id = None
+                    job.update(status="recovery_required", message=job["message"] + "；结果导出失败，修复后确认解除锁定")
+                try:
+                    self._persist(job, required=True)
+                    job.pop("storage_warning", None)
+                except RequestError as exc:
+                    job.update(status="recovery_required", message=job["message"] + "；" + str(exc))
+                    self._persist(job)
+                # 子进程退出不代表异步 Azure 请求失败；未知/存储异常必须人工核实后放行。
+                self._active_id = job["id"] if job["status"] == "recovery_required" else None
 
 
 MANAGER = DeploymentManager()
@@ -735,16 +938,54 @@ _SUBMISSION_STATES: dict[str, dict] = {}
 
 
 def submission_state(request_id: str, state: dict | None = None) -> dict:
-    """轻量请求回执，让浏览器超时后区分预检中、明确拒绝和已接收。"""
+    """请求回执用于超时后找回；已接收/已结束的 ID 永不重新执行。"""
     with _SUBMISSION_STATE_LOCK:
         if state is not None:
-            _SUBMISSION_STATES[request_id] = state
-            # 仅保留最近回执，不记录凭据或计划正文。
+            _SUBMISSION_STATES[request_id] = dict(state)
             if len(_SUBMISSION_STATES) > 200:
-                oldest = next(iter(_SUBMISSION_STATES))
-                if _SUBMISSION_STATES[oldest].get("status") != "checking":
-                    del _SUBMISSION_STATES[oldest]
-        return dict(_SUBMISSION_STATES.get(request_id, {"status": "unknown"}))
+                for oldest in list(_SUBMISSION_STATES):
+                    if oldest != request_id and _SUBMISSION_STATES[oldest].get("status") != "checking":
+                        del _SUBMISSION_STATES[oldest]
+                        break
+        if request_id in _SUBMISSION_STATES:
+            return dict(_SUBMISSION_STATES[request_id])
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,80}", request_id):
+            receipt = STATE_DIR / ("request-" + request_id + ".json")
+            try:
+                value = json.loads(receipt.read_text(encoding="utf-8"))
+                if not isinstance(value, dict) or value.get("status") not in {"accepted", "resolved"}:
+                    raise ValueError("invalid receipt")
+                return value
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, TypeError):
+                return {"status": "unknown", "blocked": True, "message": "回执读取失败，请核实上次部署"}
+        return {"status": "unknown"}
+
+
+def resolve_submission(request_id: str) -> dict:
+    """仅结束本地未知回执；不取消 Azure 操作，也不把未知任务判定为失败。"""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", request_id):
+        raise RequestError("请求标识无效")
+    if not _SUBMIT_LOCK.acquire(blocking=False):
+        raise RequestError("仍有提交正在处理，请等待后刷新状态")
+    try:
+        current = MANAGER.status()
+        if current.get("status") in {"running", "recovery_required"}:
+            raise RequestError("请先处理当前运行中或待核实的部署任务")
+        if current.get("request_id") == request_id:
+            return {"status": "accepted", "job_id": current["id"]}
+        previous = submission_state(request_id)
+        value = {"status": "resolved", "job_id": previous.get("job_id", ""),
+                 "confirmed_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+        try:
+            # 留存结束标记，防止先前超时的 POST 延迟到达后被当作新请求执行。
+            write_state_file("request-" + request_id + ".json", value)
+        except OSError:
+            raise RequestError("无法保存确认记录，请检查目录权限或磁盘空间；仍保持锁定") from None
+        return submission_state(request_id, value)
+    finally:
+        _SUBMIT_LOCK.release()
 
 
 
@@ -854,7 +1095,9 @@ class FoundryHandler(BaseHTTPRequestHandler):
             body = self.read_json()
             if path == "/api/preview-plan":
                 plan, targets, task_ids = console_plan.build_plan(body.get("targets"), body.get("tasks"))
-                self.send_json({"ok": True, "deployments": plan, "targets": targets, "task_ids": task_ids})
+                options = validate_options(body.get("options"))
+                fingerprint = console_plan.plan_fingerprint(plan, targets, task_ids, options)
+                self.send_json({"ok": True, "deployments": plan, "targets": targets, "task_ids": task_ids, "plan_hash": fingerprint})
                 return
             if path == "/api/check-plan":
                 plan, targets, task_ids = console_plan.build_plan(body.get("targets"), body.get("tasks"))
@@ -977,10 +1220,24 @@ class FoundryHandler(BaseHTTPRequestHandler):
                     credentials.clear()
                 self.send_json({"ok": True, **details})
                 return
+            if path == "/api/acknowledge-recovery":
+                if body.get("confirmed") is not True:
+                    raise RequestError("请先确认已核实云端状态")
+                self.send_json(MANAGER.acknowledge_recovery(body.get("job_id")))
+                return
+            if path == "/api/resolve-submission":
+                if body.get("confirmed") is not True:
+                    raise RequestError("请先确认已核实上次提交和云端状态")
+                request_id = clean_text(body.get("request_id"), "请求标识", required=True, limit=80)
+                self.send_json(resolve_submission(request_id))
+                return
             if path == "/api/deploy":
-                # v2 只接受目标 + 任务，不信任浏览器自行展开的行，也不做区域×模型笛卡尔积。
+                # 只接受明确的目标 + 任务；预览哈希覆盖选项，不做区域×模型笛卡尔积。
                 plan, targets, task_ids = console_plan.build_plan(body.get("targets"), body.get("tasks"))
                 options = validate_options(body.get("options"))
+                fingerprint = console_plan.plan_fingerprint(plan, targets, task_ids, options)
+                if body.get("plan_hash") != fingerprint:
+                    raise RequestError("计划或部署选项已改变，请重新预览并确认；未开始部署")
                 credentials = validate_credentials(body.get("credentials"))
                 request_id = clean_text(body.get("request_id"), "请求标识", required=True, limit=80)
                 if not re.fullmatch(r"[A-Za-z0-9_-]+", request_id):
@@ -991,12 +1248,15 @@ class FoundryHandler(BaseHTTPRequestHandler):
                     with _SUBMIT_LOCK, _DELETE_LOCK:
                         current = MANAGER.status()
                         if current.get("request_id") == request_id:
+                            if current.get("plan_hash") != fingerprint:
+                                raise RequestError("相同请求标识不能用于不同计划")
                             self.send_json(current, HTTPStatus.ACCEPTED)
                             return
-                        if submission_state(request_id).get("status") == "accepted":
-                            raise RequestError("此请求已提交过，不会重复创建；请刷新查看任务状态")
-                        if MANAGER.status().get("status") == "running":
-                            raise RequestError("已有部署正在运行，请等待完成")
+                        receipt = submission_state(request_id)
+                        if receipt.get("status") in {"accepted", "resolved"} or receipt.get("blocked"):
+                            raise RequestError("此请求已提交或需核实，不会重复创建；请刷新查看任务状态")
+                        if current.get("status") in {"running", "recovery_required"}:
+                            raise RequestError("已有任务运行中或待核实，请先处理该任务")
                         if any((row["subscription_id"], row["resource_group"].casefold()) in _DELETE_PENDING for row in plan):
                             raise RequestError("所选资源组正在删除，不能提交部署")
                         submission_state(request_id, {"status": "checking"})
@@ -1004,9 +1264,9 @@ class FoundryHandler(BaseHTTPRequestHandler):
                         inspect_targets(credentials, targets)
                         # 仅传递核心计划字段；来源约束随 JSON 传入真实部署脚本。
                         rows = [{key: str(row.get(key, "")) for key, _ in PLAN_COLUMNS} for row in plan]
-                        job = MANAGER.start(credentials, rows, options, task_ids=task_ids, request_id=request_id)
+                        job = MANAGER.start(credentials, rows, options, task_ids=task_ids, request_id=request_id, plan_hash=fingerprint)
                         handed_off = True
-                        submission_state(request_id, {"status": "accepted", "job_id": job["id"]})
+                        submission_state(request_id, {"status": "accepted", "job_id": job["id"], "plan_hash": fingerprint})
                 except Exception as exc:
                     if checking and not handed_off:
                         submission_state(request_id, {"status": "rejected", "message": redact_for_page(str(exc), credentials.get("AZURE_CLIENT_SECRET", ""))})
